@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         BIT-AutoLogin
-// @version      1.0
+// @namespace    https://github.com/GGBondHere/BIT-AutoLogin-UserScript
+// @version      2.0.0
 // @description  通过脚本实现BIT网站自动登录，可在任意学校网站页面通过一个总菜单管理所有操作。
-// @author       YuhangHere
+// @author       GGBondHere
+// @license      MIT
 // @match        *://*.bit.edu.cn/*
 // @icon         https://www.bit.edu.cn/favicon.ico
 // @grant        GM_setValue
@@ -10,348 +12,1351 @@
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @run-at       document-end
+// @downloadURL  https://raw.githubusercontent.com/GGBondHere/BIT-AutoLogin-UserScript/main/BIT-AutoLogin.user.js
+// @updateURL    https://raw.githubusercontent.com/GGBondHere/BIT-AutoLogin-UserScript/main/BIT-AutoLogin.user.js
 // ==/UserScript==
 
 (function () {
-    'use strict';
+  'use strict';
 
-    if (window.self !== window.top) {
-        return; // 在 iframe 里，直接退出
-    } // 实测在 xkjs网站会 match 到3个页面
+  const IS_NODE_TEST = Boolean(
+    typeof module === 'object' &&
+      module.exports &&
+      typeof process === 'object' &&
+      process.versions?.node
+  );
 
-    // === 常量定义 ===
-    const USERNAME_STORAGE_KEY = 'bit_login_username'; // 用于存储学号的键
-    const PASSWORD_STORAGE_KEY = 'bit_login_password'; // 用于存储加密后密码的键
-    const LOGIN_ATTEMPT_KEY = 'bit_login_attempt'; // 用于在 session 存储中标记登录尝试
+  const PROFILE_KEY = 'bit_login_profile_v2';
+  const ATTEMPT_KEY = 'bit_login_attempt_v2';
+  const LEGACY_USERNAME_KEY = 'bit_login_username';
+  const LEGACY_PASSWORD_KEY = 'bit_login_password';
+  const LEGACY_ATTEMPT_KEY = 'bit_login_last_submit_v2';
+  const DEFAULT_COOLDOWN_MS = 30_000;
+  const RATE_LIMIT_COOLDOWN_MS = 120_000;
+  const SUBMIT_DELAY_MS = 700;
+  const MANUAL_RETRY_GRACE_MS = 1_000;
+  const ATTEMPT_RESERVATION_MS = SUBMIT_DELAY_MS + 5_000;
+  const ATTEMPT_LEDGER_LIMIT = 16;
 
-    // === 核心功能：加解密与存储 ===
+  function createDefaultProfile() {
+    return {
+      schema: 2,
+      username: '',
+      secret: '',
+      autoSubmit: true,
+      showLauncher: true,
+    };
+  }
 
-    /**
-     * 使用简单的异或算法对文本进行加密或解密
-     * @param {string} text - 需要处理的文本
-     * @param {string} key - 用于加密/解密的密钥
-     * @returns {string} 处理后的文本
-     */
-    function xorCrypt(text, key) {
-        let result = '';
-        for (let i = 0; i < text.length; i++) {
-            result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-        }
-        return result;
-    } // 这是我们的简易加密/解密函数,它足够防止非技术人员（比如通过简单的浏览器工具查看存储内容）直接看到密码
-    // 它不是密码学意义上的“强加密”，但对于我们这个场景来说，在便利性和安全性之间取得了很好的平衡。
+  function normalizeProfile(value) {
+    const source = value && typeof value === 'object' ? value : {};
+    return {
+      schema: 2,
+      username: typeof source.username === 'string' ? source.username.trim() : '',
+      secret: typeof source.secret === 'string' ? source.secret : '',
+      autoSubmit: source.autoSubmit !== false,
+      showLauncher: source.showLauncher !== false,
+    };
+  }
 
-    /**
-     * 将学号和密码保存到油猴脚本的本地存储中
-     * @param {string} username - 学号
-     * @param {string} password - 原始密码
-     */
-    function setCredentials(username, password) {
-        // 保存学号到本地存储
-        GM_setValue(USERNAME_STORAGE_KEY, username);
+  function migrateLegacyProfile(currentProfile, legacy = {}) {
+    const profile = normalizeProfile(currentProfile);
+    if (profile.username && profile.secret) return profile;
 
-        // 使用学号生成加密密钥，确保每个用户的密钥不同
-        const encryptionKey = 'bit_webvpn_key_' + username;
-        try {
-            // 加密过程：先异或加密，再进行 Base64 编码
-            const encryptedPassword = btoa(xorCrypt(password, encryptionKey));
-            // 保存加密后的密码到本地存储
-            GM_setValue(PASSWORD_STORAGE_KEY, encryptedPassword);
-            console.log('BIT-Login-Script: 凭据已安全保存到本地。');
-        } catch (e) {
-            console.error('BIT-Login-Script: 密码加密及保存失败。', e);
-        }
+    const legacyUsername =
+      typeof legacy.username === 'string' ? legacy.username.trim() : '';
+    const legacySecret = typeof legacy.secret === 'string' ? legacy.secret : '';
+    if (!legacyUsername || !legacySecret) return profile;
+    if (profile.username && profile.username !== legacyUsername) return profile;
+
+    return {
+      ...profile,
+      username: profile.username || legacyUsername,
+      secret: profile.secret || legacySecret,
+    };
+  }
+
+  function xorText(text, key) {
+    let output = '';
+    for (let index = 0; index < text.length; index += 1) {
+      output += String.fromCharCode(
+        text.charCodeAt(index) ^ key.charCodeAt(index % key.length)
+      );
+    }
+    return output;
+  }
+
+  function bytesToBase64(bytes) {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    if (typeof btoa === 'function') return btoa(binary);
+    return Buffer.from(bytes).toString('base64');
+  }
+
+  function base64ToBytes(value) {
+    const binary =
+      typeof atob === 'function'
+        ? atob(value)
+        : Buffer.from(value, 'base64').toString('binary');
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  }
+
+  function encodeSecret(password, username) {
+    const encoder = new TextEncoder();
+    const input = encoder.encode(String(password));
+    const key = encoder.encode('bit-login-assistant-v2|' + String(username));
+    const output = input.map((byte, index) => byte ^ key[index % key.length]);
+    return 'v2:' + bytesToBase64(output);
+  }
+
+  function decodeSecret(secret, username) {
+    if (!secret || !username) return '';
+    const stored = String(secret);
+
+    if (stored.startsWith('v2:')) {
+      const input = base64ToBytes(stored.slice(3));
+      const key = new TextEncoder().encode(
+        'bit-login-assistant-v2|' + String(username)
+      );
+      const output = input.map((byte, index) => byte ^ key[index % key.length]);
+      return new TextDecoder().decode(output);
     }
 
-    /**
-     * 清除本地存储的学号和密码
-     */
-    function clearCredentials() {
-        GM_deleteValue(USERNAME_STORAGE_KEY);
-        GM_deleteValue(PASSWORD_STORAGE_KEY);
-        alert('已清除所有保存的登录凭据！');
+    const legacyBytes =
+      typeof atob === 'function'
+        ? atob(stored)
+        : Buffer.from(stored, 'base64').toString('binary');
+    return xorText(legacyBytes, 'bit_webvpn_key_' + String(username));
+  }
+
+  function resolveCredentialUpdate({
+    currentUsername = '',
+    currentPassword = '',
+    nextUsername = '',
+    nextPassword = '',
+  } = {}) {
+    const username = String(nextUsername).trim();
+    const password = String(nextPassword);
+    if (!username) throw new Error('学号不能为空');
+    if (password) return { username, password };
+    if (currentUsername && username !== currentUsername) {
+      throw new Error('修改学号时必须重新输入密码');
+    }
+    if (!currentPassword) throw new Error('密码不能为空');
+    return { username, password: currentPassword };
+  }
+
+  function categorizeMessage(text) {
+    const normalized = String(text || '').replace(/\s+/g, '');
+    if (!normalized) return 'unknown';
+
+    if (
+      /(用户名|账号|学号).{0,8}(或|和)?.{0,4}密码.{0,8}(错误|不正确|无效)|密码.{0,8}(错误|不正确)/.test(
+        normalized
+      )
+    ) {
+      return 'credential';
+    }
+    if (
+      /(短信|邮件|动态|一次性)?.{0,5}(验证码|校验码).{0,10}(错误|失效|不正确|过期|拒绝)/.test(
+        normalized
+      )
+    ) {
+      return 'second-factor';
+    }
+    if (
+      /(请求|操作|登录).{0,10}(频繁|过多)|稍后(再试|重试)|(^|[^0-9])429([^0-9]|$)/.test(
+        normalized
+      )
+    ) {
+      return 'rate-limit';
+    }
+    if (
+      /服务.{0,8}(不可用|异常|繁忙|维护)|系统.{0,8}(异常|维护|繁忙)|网络.{0,8}(异常|错误)/.test(
+        normalized
+      )
+    ) {
+      return 'service';
+    }
+    return 'unknown';
+  }
+
+  function classifyPage({
+    hasSecondFactor = false,
+    errorKind = 'unknown',
+    hasPasswordForm = false,
+  } = {}) {
+    if (hasSecondFactor) return 'second-factor';
+    if (errorKind === 'credential') return 'credential-error';
+    if (errorKind === 'rate-limit') return 'rate-limited';
+    if (errorKind === 'service') return 'service-error';
+    if (hasPasswordForm) return 'password';
+    return 'waiting';
+  }
+
+  function canStartPasswordAttempt(snapshot = {}, origin = 'auto') {
+    if (snapshot.hasSecondFactor || !snapshot.hasPasswordForm) return false;
+    if (origin !== 'auto') return true;
+    return classifyPage(snapshot) === 'password';
+  }
+
+  function normalizeAttemptLedger(
+    value,
+    now = Date.now(),
+    fallbackCooldownMs = DEFAULT_COOLDOWN_MS
+  ) {
+    const source = safeJsonParse(value);
+    const candidates = Array.isArray(source?.entries)
+      ? source.entries
+      : source?.context
+        ? [source]
+        : [];
+    const entriesByContext = new Map();
+
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      const context =
+        typeof candidate.context === 'string' ? candidate.context.trim() : '';
+      const timestamp = Number(candidate.timestamp);
+      const explicitBlockedUntil = Number(candidate.blockedUntil);
+      const blockedUntil = Number.isFinite(explicitBlockedUntil)
+        ? explicitBlockedUntil
+        : timestamp + fallbackCooldownMs;
+      if (!context || !Number.isFinite(timestamp) || !Number.isFinite(blockedUntil)) {
+        continue;
+      }
+      if (blockedUntil <= now) continue;
+
+      const entry = {
+        context,
+        timestamp,
+        blockedUntil,
+        phase: typeof candidate.phase === 'string' ? candidate.phase : 'submitted',
+        owner: typeof candidate.owner === 'string' ? candidate.owner : '',
+      };
+      const previous = entriesByContext.get(context);
+      if (!previous || previous.timestamp <= timestamp) {
+        entriesByContext.set(context, entry);
+      }
     }
 
-    /**
-     * 获取本地存储的学号
-     * @returns {string | null} 学号或 null
-     */
-    function getUsername() {
-        return GM_getValue(USERNAME_STORAGE_KEY, null);
+    return {
+      schema: 1,
+      entries: Array.from(entriesByContext.values())
+        .sort((left, right) => right.timestamp - left.timestamp)
+        .slice(0, ATTEMPT_LEDGER_LIMIT),
+    };
+  }
+
+  function upsertAttempt(ledger, attempt, now = Date.now()) {
+    const current = normalizeAttemptLedger(ledger, now);
+    const candidate = normalizeAttemptLedger(
+      { entries: [attempt] },
+      now
+    ).entries[0];
+    if (!candidate) return current;
+    return normalizeAttemptLedger(
+      {
+        schema: 1,
+        entries: [
+          candidate,
+          ...current.entries.filter((entry) => entry.context !== candidate.context),
+        ],
+      },
+      now
+    );
+  }
+
+  function clearAttemptContext(ledger, context, now = Date.now()) {
+    const current = normalizeAttemptLedger(ledger, now);
+    return {
+      schema: 1,
+      entries: current.entries.filter((entry) => entry.context !== context),
+    };
+  }
+
+  function canAttempt(
+    ledger,
+    context,
+    now = Date.now(),
+    cooldownMs = DEFAULT_COOLDOWN_MS
+  ) {
+    const current = normalizeAttemptLedger(ledger, now, cooldownMs);
+    return !current.entries.some(
+      (entry) => entry.context === context && entry.blockedUntil > now
+    );
+  }
+
+  function isAuthLocation(protocol, hostname, pathname) {
+    if (protocol !== 'https:') return false;
+    const host = String(hostname || '').toLowerCase();
+    const path = String(pathname || '').replace(/\/+$/, '');
+    if (host === 'sso.bit.edu.cn') return path === '/cas/login';
+    if (host === 'webvpn.bit.edu.cn') return /\/cas\/login$/i.test(path);
+    return false;
+  }
+
+  function safeJsonParse(value) {
+    if (!value) return null;
+    if (typeof value === 'object') return value;
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  if (IS_NODE_TEST) {
+    module.exports = {
+      canStartPasswordAttempt,
+      canAttempt,
+      categorizeMessage,
+      clearAttemptContext,
+      classifyPage,
+      createDefaultProfile,
+      decodeSecret,
+      encodeSecret,
+      isAuthLocation,
+      migrateLegacyProfile,
+      normalizeAttemptLedger,
+      normalizeProfile,
+      resolveCredentialUpdate,
+      upsertAttempt,
+      xorText,
+    };
+    return;
+  }
+
+  if (window.self !== window.top) return;
+
+  function element(tagName, options = {}) {
+    const node = document.createElement(tagName);
+    if (options.id) node.id = options.id;
+    if (options.className) node.className = options.className;
+    if (options.text !== undefined) node.textContent = options.text;
+    if (options.type) node.type = options.type;
+    if (options.placeholder) node.placeholder = options.placeholder;
+    if (options.title) node.title = options.title;
+    if (options.attributes) {
+      for (const [name, value] of Object.entries(options.attributes)) {
+        node.setAttribute(name, String(value));
+      }
+    }
+    return node;
+  }
+
+  function isVisible(node) {
+    if (
+      !node ||
+      node.hidden ||
+      node.disabled ||
+      node.getAttribute?.('aria-hidden') === 'true' ||
+      node.getAttribute?.('type') === 'hidden'
+    ) {
+      return false;
+    }
+    const style = getComputedStyle(node);
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      Number(style.opacity) === 0
+    ) {
+      return false;
+    }
+    return node.getClientRects().length > 0;
+  }
+
+  function setNativeValue(input, value) {
+    const prototype =
+      input instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+    if (setter) setter.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  class ProfileStore {
+    load() {
+      const current = safeJsonParse(GM_getValue(PROFILE_KEY, null));
+      const profile = migrateLegacyProfile(current, {
+        username: GM_getValue(LEGACY_USERNAME_KEY, ''),
+        secret: GM_getValue(LEGACY_PASSWORD_KEY, ''),
+      });
+
+      if (!current || JSON.stringify(normalizeProfile(current)) !== JSON.stringify(profile)) {
+        this.save(profile);
+      }
+      return profile;
     }
 
-    /**
-     * 获取本地存储并解密后的密码
-     * @returns {string | null} 解密后的密码或 null
-     */
-    function getPassword() {
-        const username = getUsername();
-        if (!username) {
-            // 如果连学号都没有，说明从未设置过，直接返回
-            return null;
-        }
-        // 使用学号生成加密密钥，确保每个用户的密钥不同
-        const encryptionKey = 'bit_webvpn_key_' + username;
-        const encryptedPassword = GM_getValue(PASSWORD_STORAGE_KEY, null);
-        if (!encryptedPassword) {
-            return null;
-        }
-        try {
-            // 解密过程：先 Base64 解码，再进行异或解密
-            const decryptedPassword = xorCrypt(atob(encryptedPassword), encryptionKey);
-            return decryptedPassword;
-        } catch (e) {
-            console.error('BIT-Login-Script: 密码解密失败，可能是存储内容已损坏。', e);
-            // 如果解密失败，清除损坏的数据
-            clearCredentials();
-            return null;
-        }
+    save(profile) {
+      const normalized = normalizeProfile(profile);
+      GM_setValue(PROFILE_KEY, JSON.stringify(normalized));
+      return normalized;
     }
 
-    // === UI 功能：首次设置引导框 ===
-    /**
-     * 显示一个用于输入学号和密码的模态框
-     */
-    function showCredentialPrompt() {
-        // 防止重复创建
-        if (document.getElementById('gm-login-prompt')) return;
+    update(patch) {
+      return this.save({ ...this.load(), ...patch });
+    }
 
-        const currentUsername = getUsername() || '';
-        const currentPassword = getPassword() || '';
+    credentials() {
+      const profile = this.load();
+      if (!profile.username || !profile.secret) {
+        return { username: profile.username, password: '', corrupt: false };
+      }
+      try {
+        return {
+          username: profile.username,
+          password: decodeSecret(profile.secret, profile.username),
+          corrupt: false,
+        };
+      } catch (error) {
+        console.error('BIT-AutoLogin：无法读取本地密码。', error);
+        return { username: profile.username, password: '', corrupt: true };
+      }
+    }
 
-        const promptHtml = `
-            <div id="gm-login-prompt-overlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 9998;"></div>
-            <div id="gm-login-prompt" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 9999; width: 320px; font-family: sans-serif;">
-                <h3 style="margin-top: 0; margin-bottom: 15px; color: #333;">设置 BIT 登录凭据</h3>
-                <p style="font-size: 13px; color: #666; margin-top: 0; margin-bottom: 15px;">您的学号和密码将经过加密后保存在浏览器本地，仅用于自动登录。</p>
-                <label for="gm-username" style="display: block; margin-bottom: 5px; font-size: 14px; color: #333;">学号</label>
-                <input type="text" id="gm-username" value="${currentUsername}" style="width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; margin-bottom: 15px;">
-                <label for="gm-password" style="display: block; margin-bottom: 5px; font-size: 14px; color: #333;">密码</label>
-                <input type="password" id="gm-password" value="${currentPassword}" style="width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; margin-bottom: 20px;">
-                <button id="gm-save-btn" style="width: 100%; padding: 10px; border: none; background-color: #007bff; color: white; border-radius: 4px; cursor: pointer; font-size: 16px;">保存</button>
-            </div>
-        `;
-        document.body.insertAdjacentHTML('beforeend', promptHtml);
+    setCredentials(username, password) {
+      return this.save({
+        ...this.load(),
+        username,
+        secret: encodeSecret(password, username),
+      });
+    }
 
-        // 点击空白区域时关闭提示框
-        function closePrompt() {
-            document.getElementById('gm-login-prompt-overlay')?.remove();
-            document.getElementById('gm-login-prompt')?.remove();
-        }
-        document.getElementById('gm-login-prompt-overlay').addEventListener('click', closePrompt);
+    applyForm(data = {}) {
+      const currentCredentials = this.credentials();
+      const hasCredentialInput =
+        Boolean(String(data.username || '').trim()) ||
+        Boolean(data.password) ||
+        Boolean(currentCredentials.username);
 
-        // 点击保存按钮时
-        document.getElementById('gm-save-btn').addEventListener('click', () => {
-            const username = document.getElementById('gm-username').value.trim();
-            const password = document.getElementById('gm-password').value; // 密码不清空格
-
-            if (username && password) {
-                setCredentials(username, password);
-                document.getElementById('gm-login-prompt-overlay').remove();
-                document.getElementById('gm-login-prompt').remove();
-                alert('学号和密码保存成功！');
-                // 保存后立即尝试登录
-                tryLogin();
-            } else {
-                alert('学号和密码不能为空！');
-            }
+      if (hasCredentialInput) {
+        const next = resolveCredentialUpdate({
+          currentUsername: currentCredentials.username,
+          currentPassword: currentCredentials.password,
+          nextUsername: data.username,
+          nextPassword: data.password,
         });
+        this.setCredentials(next.username, next.password);
+      }
+
+      return this.update({
+        autoSubmit: Boolean(data.autoSubmit),
+        showLauncher: Boolean(data.showLauncher),
+      });
     }
 
-    // === UI 功能：自定义的总菜单 ===
-    function showCustomMenu() {
-        // 防止重复创建
-        if (document.getElementById('gm-custom-menu')) return;
+    clearCredentials() {
+      const profile = this.save({
+        ...this.load(),
+        username: '',
+        secret: '',
+      });
+      GM_deleteValue(LEGACY_USERNAME_KEY);
+      GM_deleteValue(LEGACY_PASSWORD_KEY);
+      return profile;
+    }
+  }
 
-        const menuHtml = `
-            <div id="gm-custom-menu-overlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); z-index: 9998;"></div>
-            <div id="gm-custom-menu" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #f9f9f9; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.2); z-index: 9999; width: 280px; font-family: sans-serif; padding: 10px; display: flex; flex-direction: column; gap: 8px;">
-                <h4 style="margin: 5px 10px 10px; color: #333; text-align: center; font-size: 16px; border-bottom: 1px solid #eee; padding-bottom: 10px;">BIT 自动登录菜单</h4>
-                <button id="gm-menu-update" class="gm-menu-btn">⚙️ 修改/设置登录凭据</button>
-                <button id="gm-menu-clear" class="gm-menu-btn">🗑️ 清除已存登录凭据</button>
-                <button id="gm-menu-show-id" class="gm-menu-btn">🔍 显示已保存的学号</button>
-            </div>
-        `;
-        const styleHtml = `
-            <style>
-                .gm-menu-btn {
-                    width: 100%;
-                    padding: 12px;
-                    border: none;
-                    background-color: #fff;
-                    border-radius: 8px;
-                    cursor: pointer;
-                    font-size: 14px;
-                    text-align: left;
-                    color: #222;
-                    transition: background-color 0.2s, transform 0.2s;
-                    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-                }
-                .gm-menu-btn:hover {
-                    background-color: #f0f0f0;
-                    transform: translateY(-1px);
-                }
-                .gm-menu-btn:active {
-                    transform: translateY(0);
-                }
-            </style>
-        `;
-        document.head.insertAdjacentHTML('beforeend', styleHtml);
-        document.body.insertAdjacentHTML('beforeend', menuHtml);
+  class AttemptStore {
+    constructor() {
+      this.paused = false;
+      this.owner =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : 'tab-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    }
 
-        function closeMenu() {
-            document.getElementById('gm-custom-menu-overlay')?.remove();
-            document.getElementById('gm-custom-menu')?.remove();
+    read() {
+      return normalizeAttemptLedger(GM_getValue(ATTEMPT_KEY, null));
+    }
+
+    write(ledger) {
+      const normalized = normalizeAttemptLedger(ledger);
+      GM_setValue(ATTEMPT_KEY, JSON.stringify(normalized));
+      GM_deleteValue(LEGACY_ATTEMPT_KEY);
+      return normalized;
+    }
+
+    reserve(context) {
+      const now = Date.now();
+      const ledger = this.read();
+      if (!canAttempt(ledger, context, now)) return false;
+      this.write(
+        upsertAttempt(
+          ledger,
+          {
+            context,
+            timestamp: now,
+            blockedUntil: now + ATTEMPT_RESERVATION_MS,
+            phase: 'reserved',
+            owner: this.owner,
+          },
+          now
+        )
+      );
+      return this.ownsReservation(context);
+    }
+
+    ownsReservation(context) {
+      return this.read().entries.some(
+        (entry) =>
+          entry.context === context &&
+          entry.phase === 'reserved' &&
+          entry.owner === this.owner
+      );
+    }
+
+    record(context, cooldownMs = DEFAULT_COOLDOWN_MS, phase = 'submitted') {
+      const timestamp = Date.now();
+      const attempt = {
+        context,
+        timestamp,
+        blockedUntil: timestamp + cooldownMs,
+        phase,
+        owner: this.owner,
+      };
+      this.write(upsertAttempt(this.read(), attempt, timestamp));
+      return attempt;
+    }
+
+    release(context) {
+      if (!context) return;
+      const ledger = this.read();
+      const reservation = ledger.entries.find((entry) => entry.context === context);
+      if (reservation?.phase !== 'reserved' || reservation.owner !== this.owner) return;
+      this.write(clearAttemptContext(ledger, context));
+    }
+
+    clear(context = '') {
+      if (!context) {
+        GM_deleteValue(ATTEMPT_KEY);
+        GM_deleteValue(LEGACY_ATTEMPT_KEY);
+        return;
+      }
+      this.write(clearAttemptContext(this.read(), context));
+    }
+
+    isPaused() {
+      return this.paused;
+    }
+
+    setPaused(paused) {
+      this.paused = Boolean(paused);
+    }
+  }
+
+  class AuthPageAdapter {
+    constructor(doc = document) {
+      this.doc = doc;
+    }
+
+    isAuthPage() {
+      return isAuthLocation(location.protocol, location.hostname, location.pathname);
+    }
+
+    findVisible(selectors) {
+      return Array.from(this.doc.querySelectorAll(selectors)).find(isVisible) || null;
+    }
+
+    passwordForm() {
+      const username = this.findVisible('#nameInput, input[name="username"]');
+      const password = this.findVisible('input[type="password"]');
+      const submit = this.findVisible('#submitBtn, button[type="submit"]');
+      if (!username || !password || !submit) return null;
+      return { username, password, submit };
+    }
+
+    errorSignal() {
+      const selectors = [
+        '.ant-alert-message',
+        '#login-error-msg',
+        '.login-error',
+        '.error-message',
+        '[role="alert"]',
+        '.ant-message-notice-content',
+      ].join(',');
+      const priority = {
+        credential: 4,
+        'rate-limit': 3,
+        service: 2,
+        'second-factor': 1,
+        unknown: 0,
+      };
+      let selected = { kind: 'unknown', message: '' };
+
+      for (const node of this.doc.querySelectorAll(selectors)) {
+        if (!isVisible(node)) continue;
+        const message = node.textContent?.trim() || '';
+        const kind = categorizeMessage(message);
+        if (priority[kind] > priority[selected.kind]) selected = { kind, message };
+      }
+      return selected;
+    }
+
+    hasSecondFactor() {
+      if (this.findVisible('#secondSmsLoginForm')) return true;
+      const oneTimeInput = this.findVisible(
+        'input[autocomplete="one-time-code"], input[name="smsCode" i], input[id*="smsCode" i], input[name="otp" i], input[id*="otp" i]'
+      );
+      if (oneTimeInput) return true;
+
+      const metadata = this.doc.querySelector('#user-object-id');
+      const visibleStep = this.findVisible(
+        '#second-auth-tip, .second-auth-tip, #cas-gateway, [class*="secondSms"]'
+      );
+      return Boolean(metadata && visibleStep);
+    }
+
+    snapshot() {
+      const error = this.errorSignal();
+      return {
+        hasSecondFactor: this.hasSecondFactor(),
+        hasPasswordForm: Boolean(this.passwordForm()),
+        errorKind: error.kind,
+        message: error.message,
+      };
+    }
+
+    fillCredentials(username, password) {
+      const form = this.passwordForm();
+      if (!form) return false;
+      setNativeValue(form.username, username);
+      setNativeValue(form.password, password);
+      return true;
+    }
+
+    submitReady() {
+      const form = this.passwordForm();
+      if (!form) return false;
+      const button = form.submit;
+      return !(
+        button.disabled ||
+        button.getAttribute('aria-disabled') === 'true' ||
+        button.classList.contains('disabled')
+      );
+    }
+
+    submit() {
+      const form = this.passwordForm();
+      if (!form || !this.submitReady()) return false;
+      form.submit.click();
+      return true;
+    }
+
+    context() {
+      const url = new URL(location.href);
+      const service = url.searchParams.get('service') || 'no-service';
+      return [url.hostname, url.pathname, service].join('|');
+    }
+  }
+
+  class AssistantView {
+    constructor() {
+      this.root = null;
+      this.actions = {};
+      this.profile = createDefaultProfile();
+      this.currentStatus = 'waiting';
+      this.pending = false;
+      this.paused = false;
+      this.settingsOnly = false;
+    }
+
+    injectStyles() {
+      if (document.getElementById('bitla-styles')) return;
+      const style = element('style', { id: 'bitla-styles' });
+      style.textContent = `
+        #bitla-root{--bitla-bg:#0b1220;--bitla-panel:#101a2d;--bitla-card:#162238;--bitla-line:rgba(255,255,255,.12);--bitla-text:#f7f9fc;--bitla-muted:#b4bfd0;--bitla-accent:#6d8cff;--bitla-accent2:#7f5cff;--bitla-danger:#ff6b7a;--bitla-success:#34d399;--bitla-warning:#fbbf24;color-scheme:dark;font-family:Inter,"Segoe UI","PingFang SC",system-ui,sans-serif;color:var(--bitla-text)}
+        #bitla-root *{box-sizing:border-box}
+        .bitla-dock{position:fixed;right:22px;bottom:22px;z-index:2147483643;width:min(330px,calc(100vw - 44px));padding:13px;border:1px solid var(--bitla-line);border-radius:18px;color:var(--bitla-text);background:rgba(11,18,32,.96);box-shadow:0 18px 50px rgba(0,0,0,.34);backdrop-filter:blur(18px)}
+        .bitla-dock[hidden]{display:none}
+        .bitla-status-row{display:flex;align-items:flex-start;gap:10px}
+        .bitla-dot{width:9px;height:9px;margin-top:6px;border-radius:50%;background:var(--bitla-muted);box-shadow:0 0 0 4px rgba(158,171,192,.12);flex:none}
+        .bitla-dot[data-tone="success"]{background:var(--bitla-success);box-shadow:0 0 0 4px rgba(52,211,153,.13)}
+        .bitla-dot[data-tone="warning"]{background:var(--bitla-warning);box-shadow:0 0 0 4px rgba(251,191,36,.13)}
+        .bitla-dot[data-tone="danger"]{background:var(--bitla-danger);box-shadow:0 0 0 4px rgba(255,107,122,.13)}
+        .bitla-status-copy{min-width:0;flex:1}
+        .bitla-status-title{color:var(--bitla-text);font-size:14px;font-weight:700;line-height:1.4}
+        .bitla-status-detail{margin-top:3px;color:var(--bitla-muted);font-size:12px;line-height:1.45}
+        .bitla-actions{display:flex;gap:8px;margin-top:12px}
+        .bitla-btn{appearance:none;border:1px solid var(--bitla-line);border-radius:10px;padding:8px 11px;color:var(--bitla-text);background:rgba(255,255,255,.055);font:600 12px/1 "Segoe UI","PingFang SC",sans-serif;cursor:pointer;transition:background .16s ease,border-color .16s ease,transform .16s ease}
+        .bitla-btn:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.17)}
+        .bitla-btn:active{transform:translateY(1px)}
+        .bitla-btn:disabled{opacity:.42;cursor:not-allowed}
+        .bitla-btn-primary{border-color:transparent;background:linear-gradient(135deg,var(--bitla-accent),var(--bitla-accent2))}
+        .bitla-btn-danger{color:#ffd8dd;border-color:rgba(255,107,122,.26);background:rgba(255,107,122,.09)}
+        .bitla-overlay{position:fixed;inset:0;z-index:2147483646;display:grid;place-items:center;padding:18px;background:rgba(2,6,15,.66);backdrop-filter:blur(8px)}
+        .bitla-overlay[hidden]{display:none}
+        .bitla-panel{width:min(640px,100%);max-height:min(760px,calc(100vh - 36px));overflow:auto;border:1px solid var(--bitla-line);border-radius:24px;color:var(--bitla-text);background:linear-gradient(160deg,#111d33 0%,#0a1221 100%);box-shadow:0 28px 90px rgba(0,0,0,.5)}
+        .bitla-panel-head{display:flex;align-items:flex-start;justify-content:space-between;padding:22px 22px 16px;border-bottom:1px solid var(--bitla-line)}
+        .bitla-kicker{margin:0 0 4px;color:#94a8ff;font-size:11px;font-weight:800;letter-spacing:.12em}
+        .bitla-title{margin:0;color:var(--bitla-text)!important;font-size:22px;line-height:1.25}
+        .bitla-subtitle{margin:5px 0 0;color:var(--bitla-muted);font-size:13px}
+        .bitla-close{width:34px;height:34px;padding:0;border-radius:11px;font-size:18px}
+        .bitla-panel-body{display:grid;gap:14px;padding:18px 22px 22px}
+        .bitla-card{padding:16px;border:1px solid var(--bitla-line);border-radius:17px;background:rgba(255,255,255,.035)}
+        .bitla-card-title{margin:0 0 12px;color:var(--bitla-text)!important;font-size:14px;font-weight:750}
+        .bitla-panel-state{color:var(--bitla-muted);font-size:13px;line-height:1.55}
+        .bitla-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+        .bitla-field{display:grid;gap:6px}
+        .bitla-label{color:#c9d2e3;font-size:12px;font-weight:650}
+        .bitla-input{width:100%;border:1px solid var(--bitla-line);border-radius:11px;padding:11px 12px;color:var(--bitla-text);background:rgba(3,8,18,.48);outline:none;font:14px "Segoe UI","PingFang SC",sans-serif}
+        .bitla-input::placeholder{color:#8997ad;opacity:1}
+        .bitla-input:focus{border-color:rgba(109,140,255,.75);box-shadow:0 0 0 3px rgba(109,140,255,.13)}
+        .bitla-switch-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:8px 0}
+        .bitla-switch-row+.bitla-switch-row{border-top:1px solid var(--bitla-line)}
+        .bitla-switch-copy strong{display:block;color:var(--bitla-text)!important;font-size:13px}
+        .bitla-switch-copy span{display:block;margin-top:3px;color:var(--bitla-muted);font-size:11px}
+        .bitla-switch{position:relative;width:42px;height:24px;flex:none}
+        .bitla-switch input{position:absolute;opacity:0;pointer-events:none}
+        .bitla-switch-track{position:absolute;inset:0;border-radius:999px;background:#344158;cursor:pointer;transition:background .18s ease}
+        .bitla-switch-track::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 2px 7px rgba(0,0,0,.3);transition:transform .18s ease}
+        .bitla-switch input:checked+.bitla-switch-track{background:linear-gradient(135deg,var(--bitla-accent),var(--bitla-accent2))}
+        .bitla-switch input:checked+.bitla-switch-track::after{transform:translateX(18px)}
+        .bitla-footer-actions{display:flex;flex-wrap:wrap;gap:9px}
+        .bitla-wide{flex:1;min-width:130px}
+        .bitla-note{margin:10px 0 0;color:var(--bitla-muted);font-size:11px;line-height:1.5}
+        @media (max-width:620px){.bitla-grid{grid-template-columns:1fr}.bitla-panel-head{padding:18px}.bitla-panel-body{padding:14px 18px 18px}.bitla-dock{right:14px;bottom:14px}}
+      `;
+      document.head.appendChild(style);
+    }
+
+    createSwitch(title, description) {
+      const row = element('label', { className: 'bitla-switch-row' });
+      const copy = element('span', { className: 'bitla-switch-copy' });
+      copy.append(
+        element('strong', { text: title }),
+        element('span', { text: description })
+      );
+      const control = element('span', { className: 'bitla-switch' });
+      const input = element('input', { type: 'checkbox' });
+      control.append(input, element('span', { className: 'bitla-switch-track' }));
+      row.append(copy, control);
+      return { row, input };
+    }
+
+    mount(profile, { settingsOnly = false } = {}) {
+      this.settingsOnly = Boolean(settingsOnly);
+      if (this.root) {
+        this.syncProfile(profile);
+        return;
+      }
+      this.profile = profile;
+      this.injectStyles();
+
+      this.root = element('div', { id: 'bitla-root' });
+      this.root.dataset.bitlaRoot = 'true';
+
+      this.dock = element('section', {
+        className: 'bitla-dock',
+        attributes: { 'aria-live': 'polite' },
+      });
+      const statusRow = element('div', { className: 'bitla-status-row' });
+      this.statusDot = element('span', { className: 'bitla-dot' });
+      const statusCopy = element('div', { className: 'bitla-status-copy' });
+      this.statusText = element('div', {
+        className: 'bitla-status-title',
+        text: '正在读取登录页面',
+      });
+      this.statusDetail = element('div', {
+        className: 'bitla-status-detail',
+        text: '请稍候',
+      });
+      statusCopy.append(this.statusText, this.statusDetail);
+      statusRow.append(this.statusDot, statusCopy);
+
+      const dockActions = element('div', { className: 'bitla-actions' });
+      this.quickButton = element('button', {
+        className: 'bitla-btn bitla-btn-primary',
+        text: '立即登录',
+        type: 'button',
+      });
+      this.pauseButton = element('button', {
+        className: 'bitla-btn',
+        text: '暂停本页',
+        type: 'button',
+      });
+      const settingsButton = element('button', {
+        className: 'bitla-btn',
+        text: '设置',
+        type: 'button',
+      });
+      dockActions.append(this.quickButton, this.pauseButton, settingsButton);
+      this.dock.append(statusRow, dockActions);
+
+      this.overlay = element('div', { className: 'bitla-overlay' });
+      this.overlay.hidden = true;
+      const panel = element('section', {
+        className: 'bitla-panel',
+        attributes: {
+          role: 'dialog',
+          'aria-modal': 'true',
+          'aria-labelledby': 'bitla-panel-title',
+        },
+      });
+      const head = element('header', { className: 'bitla-panel-head' });
+      const headCopy = element('div');
+      headCopy.append(
+        element('p', { className: 'bitla-kicker', text: 'AUTO LOGIN' }),
+        element('h2', {
+          id: 'bitla-panel-title',
+          className: 'bitla-title',
+          text: 'BIT-AutoLogin',
+        }),
+        element('p', {
+          className: 'bitla-subtitle',
+          text: '自动登录、状态诊断和凭据管理',
+        })
+      );
+      const closeButton = element('button', {
+        className: 'bitla-btn bitla-close',
+        text: '×',
+        type: 'button',
+        attributes: { 'aria-label': '关闭设置' },
+      });
+      head.append(headCopy, closeButton);
+
+      const body = element('div', { className: 'bitla-panel-body' });
+      const stateCard = element('section', { className: 'bitla-card' });
+      stateCard.append(
+        element('h3', { className: 'bitla-card-title', text: '当前状态' })
+      );
+      this.panelStatus = element('div', {
+        className: 'bitla-panel-state',
+        text: '正在读取登录页面',
+      });
+      stateCard.append(this.panelStatus);
+
+      const credentialCard = element('section', { className: 'bitla-card' });
+      credentialCard.append(
+        element('h3', { className: 'bitla-card-title', text: '登录凭据' })
+      );
+      const credentialGrid = element('div', { className: 'bitla-grid' });
+      const usernameField = element('label', { className: 'bitla-field' });
+      usernameField.append(element('span', { className: 'bitla-label', text: '学号' }));
+      this.usernameInput = element('input', {
+        className: 'bitla-input',
+        type: 'text',
+        placeholder: '请输入学号',
+      });
+      this.usernameInput.autocomplete = 'username';
+      usernameField.append(this.usernameInput);
+      const passwordField = element('label', { className: 'bitla-field' });
+      passwordField.append(element('span', { className: 'bitla-label', text: '密码' }));
+      this.passwordInput = element('input', {
+        className: 'bitla-input',
+        type: 'password',
+        placeholder: '留空可保留现有密码',
+      });
+      this.passwordInput.autocomplete = 'new-password';
+      passwordField.append(this.passwordInput);
+      credentialGrid.append(usernameField, passwordField);
+      credentialCard.append(
+        credentialGrid,
+        element('p', {
+          className: 'bitla-note',
+          text: '密码不会回显到页面；本地保存仍属于可逆混淆，请勿在公用电脑使用。',
+        })
+      );
+
+      const preferenceCard = element('section', { className: 'bitla-card' });
+      preferenceCard.append(
+        element('h3', { className: 'bitla-card-title', text: '行为设置' })
+      );
+      const autoSwitch = this.createSwitch(
+        '自动提交密码',
+        '识别到可见密码表单后自动登录'
+      );
+      const launcherSwitch = this.createSwitch(
+        '显示页面助手',
+        '在登录页右下角显示状态和快捷入口'
+      );
+      this.autoInput = autoSwitch.input;
+      this.launcherInput = launcherSwitch.input;
+      preferenceCard.append(autoSwitch.row, launcherSwitch.row);
+
+      const actionCard = element('section', { className: 'bitla-card' });
+      const footerActions = element('div', { className: 'bitla-footer-actions' });
+      const saveButton = element('button', {
+        className: 'bitla-btn bitla-btn-primary bitla-wide',
+        text: '保存设置',
+        type: 'button',
+      });
+      this.clearButton = element('button', {
+        className: 'bitla-btn bitla-btn-danger',
+        text: '清除凭据',
+        type: 'button',
+      });
+      footerActions.append(saveButton, this.clearButton);
+      actionCard.append(footerActions);
+
+      body.append(stateCard, credentialCard, preferenceCard, actionCard);
+      panel.append(head, body);
+      this.overlay.appendChild(panel);
+      this.root.append(this.dock, this.overlay);
+      document.body.appendChild(this.root);
+
+      settingsButton.addEventListener('click', () => this.openPanel());
+      closeButton.addEventListener('click', () => this.closePanel());
+      this.overlay.addEventListener('click', (event) => {
+        if (event.target === this.overlay) this.closePanel();
+      });
+      this.overlay.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') this.closePanel();
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+          this.actions.save?.(this.formData());
         }
-        document.getElementById('gm-custom-menu-overlay').addEventListener('click', closeMenu);
+      });
+      this.quickButton.addEventListener('click', () => this.actions.login?.());
+      this.pauseButton.addEventListener('click', () => this.actions.pause?.());
+      saveButton.addEventListener('click', () => this.actions.save?.(this.formData()));
+      this.clearButton.addEventListener('click', () => this.confirmClear());
 
-        document.getElementById('gm-menu-update').addEventListener('click', () => {
-            closeMenu();
-            setTimeout(() => {
-                showCredentialPrompt();
-            }, 100); // 延迟 100 毫秒等菜单关闭动画完成
+      this.syncProfile(profile);
+    }
+
+    bind(actions) {
+      this.actions = actions;
+    }
+
+    formData() {
+      return {
+        username: this.usernameInput.value,
+        password: this.passwordInput.value,
+        autoSubmit: this.autoInput.checked,
+        showLauncher: this.launcherInput.checked,
+      };
+    }
+
+    syncProfile(profile) {
+      this.profile = profile;
+      if (!this.root) return;
+      this.usernameInput.value = profile.username;
+      this.passwordInput.value = '';
+      this.passwordInput.placeholder = profile.secret
+        ? '留空以保留现有密码'
+        : '请输入密码';
+      this.autoInput.checked = profile.autoSubmit;
+      this.launcherInput.checked = profile.showLauncher;
+      this.applyAssistantVisibility(profile.showLauncher);
+    }
+
+    applyAssistantVisibility(visible) {
+      if (!this.dock) return;
+      this.dock.hidden = this.settingsOnly || !visible;
+    }
+
+    openPanel() {
+      if (!this.overlay) return;
+      this.overlay.hidden = false;
+      this.usernameInput?.focus();
+    }
+
+    closePanel() {
+      if (this.overlay) this.overlay.hidden = true;
+    }
+
+    setInteraction({ pending = this.pending, paused = this.paused } = {}) {
+      this.pending = pending;
+      this.paused = paused;
+      if (!this.pauseButton || !this.quickButton) return;
+      this.pauseButton.textContent = pending
+        ? '取消本次'
+        : paused
+          ? '恢复本页'
+          : '暂停本页';
+      this.quickButton.disabled =
+        pending || ['second-factor', 'waiting', 'service-error'].includes(this.currentStatus);
+    }
+
+    renderStatus(status, detail = '') {
+      const states = {
+        waiting: ['正在等待登录页面', '页面结构尚未准备完成。', 'neutral'],
+        'needs-profile': ['需要设置登录凭据', '打开设置后保存学号和密码。', 'warning'],
+        ready: ['可以登录', '点击“立即登录”，或开启自动提交。', 'success'],
+        queued: ['凭据已填入', '即将点击学校页面的登录按钮，可立即取消。', 'warning'],
+        submitting: ['等待学校认证结果', '密码已经提交，请等待页面响应。', 'neutral'],
+        cooldown: ['暂缓自动提交', '当前登录目标刚刚尝试过登录；“立即登录”可手动覆盖。', 'warning'],
+        paused: ['本页自动登录已暂停', '刷新页面后会重新采用保存的设置。', 'warning'],
+        'second-factor': ['需要完成二次验证', '请在学校页面完成验证码或其他认证。', 'warning'],
+        'credential-error': ['账号或密码未通过', '已暂停本页，请检查保存的登录凭据。', 'danger'],
+        'rate-limited': ['请求过于频繁', '已延长冷却时间，请稍后再试。', 'danger'],
+        'service-error': ['认证服务暂时异常', '脚本不会继续重复提交。', 'danger'],
+        corrupt: ['本地密码无法读取', '请重新保存登录凭据。', 'danger'],
+        settings: ['设置模式', '当前页面只管理凭据，不会执行登录。', 'neutral'],
+        saved: ['设置已保存', '本次不会自动提交；需要时请在登录页点击“立即登录”。', 'success'],
+      };
+      const [title, fallback, tone] = states[status] || states.waiting;
+      this.currentStatus = status;
+      const finalDetail = detail || fallback;
+      if (this.statusText) this.statusText.textContent = title;
+      if (this.statusDetail) this.statusDetail.textContent = finalDetail;
+      if (this.panelStatus) this.panelStatus.textContent = title + '：' + finalDetail;
+      if (this.statusDot) this.statusDot.dataset.tone = tone;
+      this.setInteraction();
+    }
+
+    confirmClear() {
+      if (this.clearButton.dataset.confirming === 'true') {
+        clearTimeout(this.clearConfirmationTimer);
+        delete this.clearButton.dataset.confirming;
+        this.clearButton.textContent = '清除凭据';
+        this.actions.clear?.();
+        return;
+      }
+      this.clearButton.dataset.confirming = 'true';
+      this.clearButton.textContent = '再次点击确认';
+      this.clearConfirmationTimer = setTimeout(() => {
+        delete this.clearButton.dataset.confirming;
+        this.clearButton.textContent = '清除凭据';
+      }, 3500);
+    }
+  }
+
+  class AuthFlow {
+    constructor(store, attempts, adapter, view) {
+      this.store = store;
+      this.attempts = attempts;
+      this.adapter = adapter;
+      this.view = view;
+      this.profile = store.load();
+      this.pendingTimer = null;
+      this.observer = null;
+      this.openedInitialPanel = false;
+      this.failureState = '';
+      this.manualRetryUntil = 0;
+      this.retryEvaluationTimer = null;
+      this.reservedContext = '';
+      this.submittedContext = '';
+    }
+
+    start() {
+      this.view.mount(this.profile);
+      this.view.bind({
+        login: () => this.requestLogin('manual'),
+        pause: () => this.togglePause(),
+        save: (data) => this.save(data),
+        clear: () => this.clearCredentials(),
+      });
+      this.evaluate();
+
+      let evaluationTimer = null;
+      this.observer = new MutationObserver((mutations) => {
+        const onlyAssistantChanges = mutations.every((mutation) => {
+          const target =
+            mutation.target instanceof Element
+              ? mutation.target
+              : mutation.target.parentElement;
+          return target?.closest?.('#bitla-root');
         });
-
-        document.getElementById('gm-menu-clear').addEventListener('click', () => {
-            closeMenu();
-            setTimeout(() => {
-                clearCredentials();
-            }, 100);
-        });
-
-        document.getElementById('gm-menu-show-id').addEventListener('click', () => {
-            closeMenu();
-            const username = getUsername();
-            setTimeout(() => {
-                alert(username ? `已保存的学号：${username}` : '尚未保存学号。');
-            }, 100);
-        });
+        if (onlyAssistantChanges) return;
+        clearTimeout(evaluationTimer);
+        evaluationTimer = setTimeout(() => {
+          this.evaluate();
+        }, 80);
+      });
+      this.observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class', 'style', 'disabled', 'aria-selected'],
+      });
     }
 
-    // === 油猴菜单命令注册 ===
-    GM_registerMenuCommand('BIT 自动登录菜单', showCustomMenu);
+    evaluate() {
+      const snapshot = this.adapter.snapshot();
+      const kind = classifyPage(snapshot);
 
-    // === 登录执行逻辑 ===
-
-    /**
-     * 向输入框填值并触发相关事件，模拟用户输入
-     * @param {HTMLInputElement | HTMLTextAreaElement} element - 要填充的输入框或文本域元素
-     * @param {string} value - 要设置的值
-     */
-    function fill(element, value) {
-        element.value = value;
-        element.dispatchEvent(
-            new Event('input', {
-                bubbles: true,
-                cancelable: true,
-            })
-        );
-        element.dispatchEvent(
-            new Event('change', {
-                bubbles: true,
-                cancelable: true,
-            })
-        );
-    }
-
-    /**
-     * 检查页面是否存在登录失败的提示信息
-     * @returns {boolean} 如果发现用户名或密码错误的提示信息则返回 true，否则返回 false
-     */
-    function checkForLoginError() {
-        const errorElement = document.querySelector('.ant-alert-message');
-        if (errorElement && /密码错误/.test(errorElement.textContent)) {
-            return true;
+      if (kind === 'second-factor') {
+        this.manualRetryUntil = 0;
+        this.cancelPending(false);
+        this.submittedContext = '';
+        this.failureState = '';
+        this.view.renderStatus('second-factor', snapshot.message);
+        return;
+      }
+      if (kind === 'credential-error') {
+        if (Date.now() < this.manualRetryUntil) {
+          this.view.renderStatus(this.pendingTimer ? 'queued' : 'submitting');
+          return;
         }
-        return false;
+        this.cancelPending(false);
+        const context = this.adapter.context();
+        this.submittedContext = '';
+        this.failureState = kind;
+        this.attempts.clear(context);
+        this.attempts.setPaused(true);
+        this.view.setInteraction({ paused: true });
+        this.view.renderStatus(kind, snapshot.message);
+        return;
+      }
+      if (kind === 'rate-limited') {
+        this.cancelPending(false);
+        const context = this.adapter.context();
+        this.submittedContext = '';
+        this.failureState = kind;
+        this.attempts.record(context, RATE_LIMIT_COOLDOWN_MS, 'blocked');
+        this.attempts.setPaused(true);
+        this.view.setInteraction({ paused: true });
+        this.view.renderStatus(kind, snapshot.message);
+        return;
+      }
+      if (kind === 'service-error') {
+        this.cancelPending(false);
+        this.submittedContext = '';
+        this.failureState = kind;
+        this.attempts.setPaused(true);
+        this.view.setInteraction({ paused: true });
+        this.view.renderStatus(kind, snapshot.message);
+        return;
+      }
+      if (kind !== 'password') {
+        this.view.renderStatus('waiting');
+        return;
+      }
+
+      const credentials = this.store.credentials();
+      if (credentials.corrupt) {
+        this.view.renderStatus('corrupt');
+        if (!this.openedInitialPanel) {
+          this.openedInitialPanel = true;
+          setTimeout(() => this.view.openPanel(), 250);
+        }
+        return;
+      }
+      if (!credentials.username || !credentials.password) {
+        this.view.renderStatus('needs-profile');
+        if (!this.openedInitialPanel) {
+          this.openedInitialPanel = true;
+          setTimeout(() => this.view.openPanel(), 250);
+        }
+        return;
+      }
+      if (this.attempts.isPaused()) {
+        this.view.setInteraction({ paused: true });
+        this.view.renderStatus(this.failureState || 'paused');
+        return;
+      }
+      if (this.pendingTimer) {
+        this.view.renderStatus('queued');
+        return;
+      }
+
+      const context = this.adapter.context();
+      if (this.submittedContext === context) {
+        this.view.renderStatus('submitting');
+        return;
+      }
+      if (!canAttempt(this.attempts.read(), context)) {
+        this.view.renderStatus('cooldown');
+        return;
+      }
+
+      if (this.profile.autoSubmit) this.requestLogin('auto');
+      else this.view.renderStatus('ready');
     }
 
-    /**
-     * 尝试执行一次完整的登录流程
-     * @returns {boolean} 是否诊断到错误或成功登录
-     */
-    function tryLogin() {
-        // 模式一：诊断模式 - 登录失败可能面临的问题
-        if (sessionStorage.getItem(LOGIN_ATTEMPT_KEY) === 'true') {
-            console.log('BIT-Login-Script: 进入登录后诊断模式...');
-            sessionStorage.removeItem(LOGIN_ATTEMPT_KEY); // 读取记录后立即清除
+    requestLogin(origin) {
+      if (this.pendingTimer) return;
 
-            const observer = new MutationObserver(() => {
-                if (checkForLoginError()) {
-                    observer.disconnect();
-                    console.warn('BIT-Login-Script: 检测到登录失败，凭据无效。');
-                    alert('BIT-AutoLogin检测到登录失败，已保存的学号或密码是错误的。\n将为您清除旧数据并重新设置。');
-                    clearCredentials();
-                    setTimeout(showCredentialPrompt, 100);
-                }
-            });
-            observer.observe(document.documentElement, {
-                childList: true,
-                subtree: true,
-            });
-            setTimeout(() => observer.disconnect(), 3000);
-            return true;
+      const snapshot = this.adapter.snapshot();
+      if (!canStartPasswordAttempt(snapshot, origin)) {
+        this.evaluate();
+        return;
+      }
+      const context = this.adapter.context();
+      if (origin === 'manual') {
+        this.attempts.clear(context);
+        this.attempts.setPaused(false);
+        this.submittedContext = '';
+        this.failureState = '';
+      }
+      if (origin !== 'auto') {
+        this.manualRetryUntil =
+          Date.now() + SUBMIT_DELAY_MS + MANUAL_RETRY_GRACE_MS;
+      }
+      const credentials = this.store.credentials();
+      if (credentials.corrupt || !credentials.username || !credentials.password) {
+        this.view.renderStatus(credentials.corrupt ? 'corrupt' : 'needs-profile');
+        this.view.openPanel();
+        return;
+      }
+      if (!this.attempts.reserve(context)) {
+        this.view.renderStatus('cooldown');
+        return;
+      }
+      this.reservedContext = context;
+      if (!this.adapter.fillCredentials(credentials.username, credentials.password)) {
+        this.attempts.release(context);
+        this.reservedContext = '';
+        this.manualRetryUntil = 0;
+        this.view.renderStatus('waiting', '没有发现可见的账号密码表单。');
+        return;
+      }
+
+      this.view.setInteraction({ pending: true, paused: false });
+      this.view.renderStatus('queued');
+      this.pendingTimer = setTimeout(() => {
+        this.pendingTimer = null;
+        if (!this.attempts.ownsReservation(context)) {
+          this.reservedContext = '';
+          this.manualRetryUntil = 0;
+          this.view.setInteraction({ pending: false });
+          this.view.renderStatus('cooldown');
+          return;
         }
-
-        // 模式二：登录模式
-        const username = getUsername();
-        const password = getPassword();
-        const userInput = document.querySelector('#nameInput');
-        const passInput = document.querySelector('input[type="password"]');
-
-        if (!userInput || !passInput) {
-            console.error('BIT-Login-Script: 错误！tryLogin被调用，但登录框元素未找到。');
-            return false;
+        if (!this.adapter.submit()) {
+          this.attempts.release(context);
+          this.reservedContext = '';
+          this.manualRetryUntil = 0;
+          this.view.setInteraction({ pending: false });
+          this.view.renderStatus(
+            'ready',
+            '学校登录按钮尚未就绪，脚本没有点击；可稍后手动重试。'
+          );
+          return;
         }
-
-        fill(userInput, username);
-        fill(passInput, password);
-
-        const loginButton = document.querySelector('#submitBtn');
-        if (loginButton && !loginButton.disabled) {
-            sessionStorage.setItem(LOGIN_ATTEMPT_KEY, 'true');
-            setTimeout(() => loginButton.click(), 100);
-            return true;
+        this.attempts.record(context);
+        this.reservedContext = '';
+        this.submittedContext = context;
+        this.manualRetryUntil =
+          origin !== 'auto' ? Date.now() + MANUAL_RETRY_GRACE_MS : 0;
+        this.view.setInteraction({ pending: false });
+        this.view.renderStatus('submitting');
+        if (origin !== 'auto') {
+          clearTimeout(this.retryEvaluationTimer);
+          this.retryEvaluationTimer = setTimeout(() => {
+            this.manualRetryUntil = 0;
+            this.evaluate();
+          }, MANUAL_RETRY_GRACE_MS);
         }
+      }, SUBMIT_DELAY_MS);
     }
 
-    // === 主程序入口与页面判断 ===
-    // 脚本启动时，先判断是否在目标页面，再决定是否执行登录逻辑
-    function isLoginPage() {
-        // 使用正则表达式来匹配两个登录页的 URL 格式
-        const loginPageRegex = /^https:\/\/(webvpn\.bit\.edu\.cn\/.*?\/cas\/login|sso\.bit\.edu\.cn\/cas\/login)/;
-        return loginPageRegex.test(window.location.href);
+    cancelPending(pause = true) {
+      this.manualRetryUntil = 0;
+      clearTimeout(this.retryEvaluationTimer);
+      this.retryEvaluationTimer = null;
+      if (this.pendingTimer) {
+        clearTimeout(this.pendingTimer);
+        this.pendingTimer = null;
+      }
+      if (this.reservedContext) {
+        this.attempts.release(this.reservedContext);
+        this.reservedContext = '';
+      }
+      if (pause) {
+        this.attempts.setPaused(true);
+        this.view.setInteraction({ pending: false, paused: true });
+        this.view.renderStatus('paused');
+      } else {
+        this.view.setInteraction({ pending: false });
+      }
     }
 
-    function main() {
-        if (!getUsername() || !getPassword()) {
-            // 无凭据 -> 显示设置引导
-            setTimeout(showCredentialPrompt, 1000);
-        } else {
-            // 有凭据 -> 尝试登录
-            if (!tryLogin()) {
-                // 如果首次登录失败（比如表单还没加载），启动观察器
-                const observer = new MutationObserver(() => {
-                    if (tryLogin()) {
-                        observer.disconnect();
-                    }
-                });
-                observer.observe(document.documentElement, {
-                    childList: true,
-                    subtree: true,
-                });
-                setTimeout(() => observer.disconnect(), 5000);
-            }
-        }
+    togglePause() {
+      if (this.pendingTimer) {
+        this.cancelPending(true);
+        return;
+      }
+      const paused = !this.attempts.isPaused();
+      this.attempts.setPaused(paused);
+      this.failureState = '';
+      this.view.setInteraction({ paused });
+      if (paused) this.view.renderStatus('paused');
+      else if (this.profile.autoSubmit) this.requestLogin('resume');
+      else this.evaluate();
     }
 
-    if (isLoginPage()) {
-        console.log('BIT-Login-Script: 检测到登录页面，启动自动登录程序。');
-        main();
-    } else {
-        // 在其他页面，脚本静默，只提供菜单功能，清理可能遗留的登录记录，以防万一
-        if (sessionStorage.getItem(LOGIN_ATTEMPT_KEY)) {
-            sessionStorage.removeItem(LOGIN_ATTEMPT_KEY);
-        }
+    save(data) {
+      try {
+        this.profile = this.store.applyForm(data);
+        this.view.syncProfile(this.profile);
+        this.view.renderStatus('saved');
+        this.view.closePanel();
+      } catch (error) {
+        this.view.renderStatus('needs-profile', error.message || '设置保存失败。');
+      }
     }
+
+    clearCredentials() {
+      this.cancelPending(false);
+      this.profile = this.store.clearCredentials();
+      this.attempts.setPaused(false);
+      this.submittedContext = '';
+      this.failureState = '';
+      this.view.syncProfile(this.profile);
+      this.view.renderStatus('needs-profile', '本地保存的学号和密码已经清除。');
+    }
+
+  }
+
+  class SettingsFlow {
+    constructor(store, view) {
+      this.store = store;
+      this.view = view;
+      this.profile = store.load();
+    }
+
+    start() {
+      this.view.mount(this.profile, { settingsOnly: true });
+      this.view.bind({
+        save: (data) => this.save(data),
+        clear: () => this.clearCredentials(),
+      });
+      this.view.renderStatus('settings');
+      this.view.openPanel();
+    }
+
+    save(data) {
+      try {
+        this.profile = this.store.applyForm(data);
+        this.view.syncProfile(this.profile);
+        this.view.renderStatus('saved');
+      } catch (error) {
+        this.view.renderStatus('needs-profile', error.message || '设置保存失败。');
+      }
+    }
+
+    clearCredentials() {
+      this.profile = this.store.clearCredentials();
+      this.view.syncProfile(this.profile);
+      this.view.renderStatus('needs-profile', '本地保存的学号和密码已经清除。');
+    }
+  }
+
+  class App {
+    constructor() {
+      this.store = new ProfileStore();
+      this.attempts = new AttemptStore();
+      this.adapter = new AuthPageAdapter();
+      this.view = null;
+      this.flow = null;
+    }
+
+    start() {
+      GM_registerMenuCommand('BIT 自动登录菜单', () => this.openFromMenu());
+      if (!this.adapter.isAuthPage()) return;
+      this.view = new AssistantView();
+      this.flow = new AuthFlow(this.store, this.attempts, this.adapter, this.view);
+      this.flow.start();
+    }
+
+    openFromMenu() {
+      if (!this.view) {
+        this.view = new AssistantView();
+        this.flow = this.adapter.isAuthPage()
+          ? new AuthFlow(this.store, this.attempts, this.adapter, this.view)
+          : new SettingsFlow(this.store, this.view);
+        this.flow.start();
+      }
+      this.view.openPanel();
+    }
+  }
+
+  new App().start();
 })();
