@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BIT-AutoLogin
 // @namespace    https://github.com/GGBondHere/BIT-AutoLogin-UserScript
-// @version      2.0.0
+// @version      2.0.1
 // @description  通过脚本实现BIT网站自动登录，可在任意学校网站页面通过一个总菜单管理所有操作。
 // @author       GGBondHere
 // @license      MIT
@@ -146,6 +146,20 @@
     return { username, password: currentPassword };
   }
 
+  function redactMessage(text) {
+    return String(text || '')
+      .replace(/https?:\/\/[^\s"'<>]+/gi, '[链接已隐藏]')
+      .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [已隐藏]')
+      .replace(
+        /((?:\b(?:access[_-]?token|response[_-]?token|token|ticket|sms[_-]?code|captcha[_-]?code|password|passwd|phone|mobile|tel)\b|密码|口令|手机号|手机号码|验证码|校验码)["']?\s*[:：=]\s*["']?)[^\s&,;}\])"']+/gi,
+        '$1[已隐藏]'
+      )
+      .replace(/(?<!\d)(?:\+?86[-\s]?)?(1[3-9]\d{9})(?!\d)/g, (_, phone) =>
+        phone.slice(0, 3) + '****' + phone.slice(-4)
+      )
+      .slice(0, 500);
+  }
+
   function categorizeMessage(text) {
     const normalized = String(text || '').replace(/\s+/g, '');
     if (!normalized) return 'unknown';
@@ -157,12 +171,10 @@
     ) {
       return 'credential';
     }
-    if (
-      /(短信|邮件|动态|一次性)?.{0,5}(验证码|校验码).{0,10}(错误|失效|不正确|过期|拒绝)/.test(
-        normalized
-      )
-    ) {
-      return 'second-factor';
+    if (/(验证码|校验码).{0,10}(错误|失效|不正确|过期|拒绝)/.test(normalized)) {
+      if (/(图形|图片|图像)|captcha/i.test(normalized)) return 'captcha';
+      if (/(短信|邮件|动态|一次性)/.test(normalized)) return 'second-factor';
+      return 'verification';
     }
     if (
       /(请求|操作|登录).{0,10}(频繁|过多)|稍后(再试|重试)|(^|[^0-9])429([^0-9]|$)/.test(
@@ -183,19 +195,34 @@
 
   function classifyPage({
     hasSecondFactor = false,
+    hasSmsLogin = false,
+    hasCaptcha = false,
     errorKind = 'unknown',
     hasPasswordForm = false,
   } = {}) {
     if (hasSecondFactor) return 'second-factor';
+    if (hasSmsLogin) return 'sms-login';
     if (errorKind === 'credential') return 'credential-error';
     if (errorKind === 'rate-limit') return 'rate-limited';
     if (errorKind === 'service') return 'service-error';
+    if (errorKind === 'second-factor') return 'second-factor';
+    if (hasCaptcha || errorKind === 'captcha') return 'captcha';
+    if (errorKind === 'verification') return hasPasswordForm ? 'captcha' : 'second-factor';
     if (hasPasswordForm) return 'password';
     return 'waiting';
   }
 
   function canStartPasswordAttempt(snapshot = {}, origin = 'auto') {
-    if (snapshot.hasSecondFactor || !snapshot.hasPasswordForm) return false;
+    if (snapshot.hasSecondFactor || snapshot.hasSmsLogin || !snapshot.hasPasswordForm) {
+      return false;
+    }
+    if (snapshot.errorKind === 'second-factor') return false;
+    if (
+      (snapshot.hasCaptcha || ['captcha', 'verification'].includes(snapshot.errorKind)) &&
+      !snapshot.captchaReady
+    ) {
+      return false;
+    }
     if (origin !== 'auto') return true;
     return classifyPage(snapshot) === 'password';
   }
@@ -346,10 +373,13 @@
   }
 
   function isVisible(node) {
+    return !node?.disabled && isRendered(node);
+  }
+
+  function isRendered(node) {
     if (
       !node ||
       node.hidden ||
-      node.disabled ||
       node.getAttribute?.('aria-hidden') === 'true' ||
       node.getAttribute?.('type') === 'hidden'
     ) {
@@ -560,13 +590,20 @@
     }
 
     findVisible(selectors) {
-      return Array.from(this.doc.querySelectorAll(selectors)).find(isVisible) || null;
+      return Array.from(this.doc.querySelectorAll(selectors)).find(
+        (node) => !node.closest('#bitla-root') && isVisible(node)
+      ) || null;
     }
 
     passwordForm() {
       const username = this.findVisible('#nameInput, input[name="username"]');
-      const password = this.findVisible('input[type="password"]');
-      const submit = this.findVisible('#submitBtn, button[type="submit"]');
+      if (!username) return null;
+      const scope = username.closest('form') || this.doc;
+      const visible = (selectors) => Array.from(scope.querySelectorAll(selectors)).find(
+        (node) => !node.closest('#bitla-root') && isVisible(node)
+      );
+      const password = visible('input[type="password"]');
+      const submit = visible('#submitBtn, button[type="submit"]');
       if (!username || !password || !submit) return null;
       return { username, password, submit };
     }
@@ -585,6 +622,8 @@
         'rate-limit': 3,
         service: 2,
         'second-factor': 1,
+        captcha: 1,
+        verification: 1,
         unknown: 0,
       };
       let selected = { kind: 'unknown', message: '' };
@@ -598,24 +637,47 @@
       return selected;
     }
 
-    hasSecondFactor() {
-      if (this.findVisible('#secondSmsLoginForm')) return true;
-      const oneTimeInput = this.findVisible(
+    captchaInput() {
+      const scope = this.passwordForm()?.username.closest('form') || this.doc;
+      return Array.from(scope.querySelectorAll(
+        'input[name*="captcha" i], input[id*="captcha" i], input[placeholder*="图形"], input[placeholder*="图片"]'
+      )).find((input) => !input.closest('#bitla-root') && isRendered(input)) || null;
+    }
+
+    oneTimeInput() {
+      return this.findVisible(
         'input[autocomplete="one-time-code"], input[name="smsCode" i], input[id*="smsCode" i], input[name="otp" i], input[id*="otp" i]'
       );
-      if (oneTimeInput) return true;
+    }
+
+    hasSmsLogin() {
+      if (this.findVisible('form[id*="smsLoginForm" i]:not([id*="second" i])')) return true;
+      const phoneInput = this.findVisible(
+        'input[type="tel"], input[name="phone" i], input[name="mobile" i], #phoneInput'
+      );
+      return Boolean(phoneInput && this.oneTimeInput() && !this.passwordForm());
+    }
+
+    hasSecondFactor() {
+      if (this.findVisible('#secondSmsLoginForm')) return true;
 
       const metadata = this.doc.querySelector('#user-object-id');
       const visibleStep = this.findVisible(
         '#second-auth-tip, .second-auth-tip, #cas-gateway, [class*="secondSms"]'
       );
-      return Boolean(metadata && visibleStep);
+      if (metadata?.textContent?.trim() && visibleStep) return true;
+      const oneTimeInput = this.oneTimeInput();
+      return Boolean(oneTimeInput && oneTimeInput !== this.captchaInput() && !this.hasSmsLogin());
     }
 
     snapshot() {
       const error = this.errorSignal();
+      const captcha = this.captchaInput();
       return {
         hasSecondFactor: this.hasSecondFactor(),
+        hasSmsLogin: this.hasSmsLogin(),
+        hasCaptcha: Boolean(captcha),
+        captchaReady: Boolean(captcha && !captcha.disabled && captcha.value.trim()),
         hasPasswordForm: Boolean(this.passwordForm()),
         errorKind: error.kind,
         message: error.message,
@@ -643,7 +705,9 @@
 
     submit() {
       const form = this.passwordForm();
-      if (!form || !this.submitReady()) return false;
+      if (!form || !this.submitReady() || !canStartPasswordAttempt(this.snapshot(), 'manual')) {
+        return false;
+      }
       form.submit.click();
       return true;
     }
@@ -663,6 +727,8 @@
       this.currentStatus = 'waiting';
       this.pending = false;
       this.paused = false;
+      this.hasCaptcha = false;
+      this.captchaReady = false;
       this.settingsOnly = false;
     }
 
@@ -960,9 +1026,16 @@
       if (this.overlay) this.overlay.hidden = true;
     }
 
-    setInteraction({ pending = this.pending, paused = this.paused } = {}) {
+    setInteraction({
+      pending = this.pending,
+      paused = this.paused,
+      hasCaptcha = this.hasCaptcha,
+      captchaReady = this.captchaReady,
+    } = {}) {
       this.pending = pending;
       this.paused = paused;
+      this.hasCaptcha = hasCaptcha;
+      this.captchaReady = captchaReady;
       if (!this.pauseButton || !this.quickButton) return;
       this.pauseButton.textContent = pending
         ? '取消本次'
@@ -970,7 +1043,9 @@
           ? '恢复本页'
           : '暂停本页';
       this.quickButton.disabled =
-        pending || ['second-factor', 'waiting', 'service-error'].includes(this.currentStatus);
+        pending ||
+        (hasCaptcha && !captchaReady) ||
+        ['second-factor', 'sms-login', 'waiting', 'service-error'].includes(this.currentStatus);
     }
 
     renderStatus(status, detail = '') {
@@ -982,7 +1057,15 @@
         submitting: ['等待学校认证结果', '密码已经提交，请等待页面响应。', 'neutral'],
         cooldown: ['暂缓自动提交', '当前登录目标刚刚尝试过登录；“立即登录”可手动覆盖。', 'warning'],
         paused: ['本页自动登录已暂停', '刷新页面后会重新采用保存的设置。', 'warning'],
-        'second-factor': ['需要完成二次验证', '请在学校页面完成验证码或其他认证。', 'warning'],
+        captcha: [
+          this.captchaReady ? '图形验证码已填写' : '需要填写图形验证码',
+          this.captchaReady
+            ? '请点击“立即登录”或学校登录按钮，脚本不会自动提交。'
+            : '请在学校页面填写图片中的字符，再点击登录。',
+          'warning',
+        ],
+        'sms-login': ['短信登录模式', '请在学校页面获取、填写短信验证码并登录。', 'warning'],
+        'second-factor': ['需要完成二次验证', '请在学校页面填写短信验证码或完成其他二次认证。', 'warning'],
         'credential-error': ['账号或密码未通过', '已暂停本页，请检查保存的登录凭据。', 'danger'],
         'rate-limited': ['请求过于频繁', '已延长冷却时间，请稍后再试。', 'danger'],
         'service-error': ['认证服务暂时异常', '脚本不会继续重复提交。', 'danger'],
@@ -992,7 +1075,7 @@
       };
       const [title, fallback, tone] = states[status] || states.waiting;
       this.currentStatus = status;
-      const finalDetail = detail || fallback;
+      const finalDetail = redactMessage(detail || fallback);
       if (this.statusText) this.statusText.textContent = title;
       if (this.statusDetail) this.statusDetail.textContent = finalDetail;
       if (this.panelStatus) this.panelStatus.textContent = title + '：' + finalDetail;
@@ -1025,6 +1108,7 @@
       this.view = view;
       this.profile = store.load();
       this.pendingTimer = null;
+      this.pendingOrigin = '';
       this.observer = null;
       this.openedInitialPanel = false;
       this.failureState = '';
@@ -1045,6 +1129,15 @@
       this.evaluate();
 
       let evaluationTimer = null;
+      const scheduleEvaluation = () => {
+        clearTimeout(evaluationTimer);
+        evaluationTimer = setTimeout(() => this.evaluate(), 80);
+      };
+      const onCaptchaInput = (event) => {
+        if (event.target === this.adapter.captchaInput()) scheduleEvaluation();
+      };
+      document.addEventListener('input', onCaptchaInput, true);
+      document.addEventListener('change', onCaptchaInput, true);
       this.observer = new MutationObserver((mutations) => {
         const onlyAssistantChanges = mutations.every((mutation) => {
           const target =
@@ -1054,29 +1147,54 @@
           return target?.closest?.('#bitla-root');
         });
         if (onlyAssistantChanges) return;
-        clearTimeout(evaluationTimer);
-        evaluationTimer = setTimeout(() => {
-          this.evaluate();
-        }, 80);
+        scheduleEvaluation();
       });
       this.observer.observe(document.documentElement, {
         childList: true,
         subtree: true,
         attributes: true,
-        attributeFilter: ['class', 'style', 'disabled', 'aria-selected'],
+        attributeFilter: ['class', 'style', 'disabled', 'hidden', 'aria-hidden', 'aria-selected', 'src'],
       });
     }
 
     evaluate() {
       const snapshot = this.adapter.snapshot();
       const kind = classifyPage(snapshot);
+      this.view.setInteraction({
+        hasCaptcha: kind === 'captcha' || snapshot.hasCaptcha,
+        captchaReady: snapshot.captchaReady,
+      });
 
-      if (kind === 'second-factor') {
+      if (['password', 'captcha'].includes(kind)) {
+        const credentials = this.store.credentials();
+        if (credentials.corrupt || !credentials.username || !credentials.password) {
+          this.cancelPending(false);
+          this.view.renderStatus(credentials.corrupt ? 'corrupt' : 'needs-profile');
+          if (!this.openedInitialPanel) {
+            this.openedInitialPanel = true;
+            setTimeout(() => this.view.openPanel(), 250);
+          }
+          return;
+        }
+      }
+      if (kind === 'captcha') {
+        const manualPending = this.pendingTimer && this.pendingOrigin !== 'auto' &&
+          canStartPasswordAttempt(snapshot, this.pendingOrigin);
+        const waitingForResult = snapshot.captchaReady &&
+          this.submittedContext === this.adapter.context() &&
+          (!['captcha', 'verification'].includes(snapshot.errorKind) ||
+            Date.now() < this.manualRetryUntil);
+        if (manualPending || waitingForResult) {
+          this.view.renderStatus(this.pendingTimer ? 'queued' : 'submitting');
+          return;
+        }
+      }
+      if (['captcha', 'sms-login', 'second-factor'].includes(kind)) {
         this.manualRetryUntil = 0;
         this.cancelPending(false);
         this.submittedContext = '';
         this.failureState = '';
-        this.view.renderStatus('second-factor', snapshot.message);
+        this.view.renderStatus(kind, snapshot.message);
         return;
       }
       if (kind === 'credential-error') {
@@ -1119,23 +1237,6 @@
         return;
       }
 
-      const credentials = this.store.credentials();
-      if (credentials.corrupt) {
-        this.view.renderStatus('corrupt');
-        if (!this.openedInitialPanel) {
-          this.openedInitialPanel = true;
-          setTimeout(() => this.view.openPanel(), 250);
-        }
-        return;
-      }
-      if (!credentials.username || !credentials.password) {
-        this.view.renderStatus('needs-profile');
-        if (!this.openedInitialPanel) {
-          this.openedInitialPanel = true;
-          setTimeout(() => this.view.openPanel(), 250);
-        }
-        return;
-      }
       if (this.attempts.isPaused()) {
         this.view.setInteraction({ paused: true });
         this.view.renderStatus(this.failureState || 'paused');
@@ -1200,13 +1301,21 @@
 
       this.view.setInteraction({ pending: true, paused: false });
       this.view.renderStatus('queued');
+      this.pendingOrigin = origin;
       this.pendingTimer = setTimeout(() => {
         this.pendingTimer = null;
+        this.pendingOrigin = '';
         if (!this.attempts.ownsReservation(context)) {
           this.reservedContext = '';
           this.manualRetryUntil = 0;
           this.view.setInteraction({ pending: false });
           this.view.renderStatus('cooldown');
+          return;
+        }
+        if (this.adapter.context() !== context ||
+          !canStartPasswordAttempt(this.adapter.snapshot(), origin)) {
+          this.cancelPending(false);
+          this.evaluate();
           return;
         }
         if (!this.adapter.submit()) {
@@ -1239,6 +1348,7 @@
 
     cancelPending(pause = true) {
       this.manualRetryUntil = 0;
+      this.pendingOrigin = '';
       clearTimeout(this.retryEvaluationTimer);
       this.retryEvaluationTimer = null;
       if (this.pendingTimer) {
